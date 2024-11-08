@@ -1,0 +1,234 @@
+######################
+# Import packages
+######################
+
+# import pysqlite3
+__import__('pysqlite3')
+import sys
+sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+
+import streamlit as st
+import sqlite3
+
+from openai import OpenAI
+
+# Common imports
+import os
+import requests
+from dotenv import load_dotenv
+import json
+import lolviz
+import tiktoken
+
+from langchain_openai import OpenAIEmbeddings
+from langchain_community.vectorstores import Chroma
+from langchain.chains import RetrievalQA
+# from langchain_community.retrievers import WebRetriever
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_openai import ChatOpenAI
+from langchain_chroma import Chroma
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
+
+import hmac
+
+######################
+# Paswword
+######################
+def check_password():  
+    """Returns `True` if the user had the correct password."""  
+    def password_entered():  
+        """Checks whether a password entered by the user is correct."""  
+        if hmac.compare_digest(st.session_state["password"], st.secrets["password"]):  
+            st.session_state["password_correct"] = True  
+            del st.session_state["password"]  # Don't store the password.  
+        else:  
+            st.session_state["password_correct"] = False  
+    # Return True if the passward is validated.  
+    if st.session_state.get("password_correct", False):  
+        return True  
+    # Show input for password.  
+    st.text_input(  
+        "Password", type="password", on_change=password_entered, key="password"  
+    )  
+    if "password_correct" in st.session_state:  
+        st.error("😕 Password incorrect")  
+    return False 
+# Do not continue if check_password is not True.  
+if not check_password():  
+    st.stop()
+
+##############
+#Interface
+##############
+st.title("CPF Healthcare Financing")
+"""
+In this page, you can ask about healthcare financing related to CPF.
+
+Enter your question below:
+
+"""
+
+##################
+# Prompting
+##################
+def get_user_prompt():
+    return st.chat_input(placeholder="Can I use my Medisave for hospitalisation?")
+
+
+######################
+# Loading API
+######################
+# Load the environment variables
+# If the .env file is not found, the function will return `False
+load_dotenv('.env')
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+###################
+# Embedding
+###################
+# def get_embedding(input, model='text-embedding-3-small'):
+#     response = client.embeddings.create(
+#         input=input,
+#         model=model
+#     )
+#     return [x.embedding for x in response.data]
+
+####################
+# Text generation
+####################
+# def get_completion(prompt, model=OPENAI_MODEL_NAME, temperature=0, top_p=1.0, max_tokens=256, n=1, json_output=False):
+#     if json_output == True:
+#       output_json_structure = {"type": "json_object"}
+#     else:
+#       output_json_structure = None
+
+#     messages = [{"role": "user", "content": prompt}]
+#     response = client.chat.completions.create( #originally was openai.chat.completions
+#         model=model,
+#         messages=messages,
+#         temperature=temperature,
+#         top_p=top_p,
+#         max_tokens=max_tokens,
+#         n=1,
+#         response_format=output_json_structure,
+#     )
+#     return response.choices[0].message.content
+
+# def get_completion_by_messages(messages, model="gpt-4o-mini", temperature=0, top_p=1.0, max_tokens=1024, n=1):
+#     response = client.chat.completions.create(
+#         model=model,
+#         messages=messages,
+#         temperature=temperature,
+#         top_p=top_p,
+#         max_tokens=max_tokens,
+#         n=1
+#     )
+#     return response.choices[0].message.content
+
+def count_tokens(text):
+    encoding = tiktoken.encoding_for_model('gpt-4o-mini')
+    return len(encoding.encode(text))
+
+def count_tokens_from_message_rough(messages):
+    encoding = tiktoken.encoding_for_model('gpt-4o-mini')
+    value = ' '.join([x.get('content') for x in messages])
+    return len(encoding.encode(value))
+
+##################################
+# Setting up Credential LangChain
+#################################
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+# embedding model that we will use for the session
+embeddings_model = OpenAIEmbeddings(model='text-embedding-3-small')
+
+# llm to be used in RAG pipeplines in this notebook
+llm = ChatOpenAI(model='gpt-4o-mini', temperature=0, seed=42)
+
+######################
+# RAG
+######################
+loader1 = WebBaseLoader(["https://www.cpf.gov.sg/member/healthcare-financing/using-your-medisave-savings/using-medisave-for-outpatient-treatments"])
+loader2 = WebBaseLoader(["https://www.cpf.gov.sg/member/healthcare-financing/medishield-life/what-medishield-life-covers-you-for"])
+loader3 = WebBaseLoader(["https://www.cpf.gov.sg/member/healthcare-financing/using-your-medisave-savings/using-medisave-for-hospitalisation"])
+loader4 = WebBaseLoader(["https://www.cpf.gov.sg/member/healthcare-financing/careshield-life"])
+loader5 = WebBaseLoader(["https://www.cpf.gov.sg/member/healthcare-financing/eldershield"])
+loader6 = WebBaseLoader(["https://www.cpf.gov.sg/member/healthcare-financing/medisave-care-for-long-term-care-needs"])
+
+
+loaderlist = [loader1, loader2, loader3, loader4, loader5, loader6]
+
+list_of_documents_loaded=[]
+for loader in loaderlist:
+    try: 
+        # markdown_path = os.path.join('notes', file)
+        # loader = TextLoader(markdown_path)
+        docs = loader.load()
+        list_of_documents_loaded.extend(docs)
+    except Exception as e:
+        continue
+
+# st.write(list_of_documents_loaded)
+
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1100, chunk_overlap=10, length_function=count_tokens)
+
+# Split the documents into smaller chunks
+splitted_documents = text_splitter.split_documents(list_of_documents_loaded)
+
+# Create the vector database
+vectordb = Chroma.from_documents(
+    documents=splitted_documents,
+    embedding=embeddings_model,
+    collection_name="naive_splitter", # one database can have multiple collections
+    persist_directory="./vector_db"
+)
+
+
+# def process_prompt(prompt, rag_chain):
+#     response = rag_chain({"query": prompt})
+#     answer = response["result"]
+#     source_documents = response.get("source_documents", [])
+    
+#     st.write("Answer:", answer)
+    # if source_documents:
+    #     st.write("\nSource Documents:")
+    #     for doc in source_documents:
+    #         st.write(f"- {doc.metadata['source']}")
+
+rag_chain = RetrievalQA.from_llm(retriever=vectordb.as_retriever(), llm=llm)
+
+def main():
+    try:
+        user_prompt = get_user_prompt()
+        # rag_chain = setup_rag()
+        # process_prompt(user_prompt, rag_chain)
+        llm_response = rag_chain.invoke(user_prompt)
+        st.write(llm_response['result'])
+    except TypeError as e:
+        pass
+    
+if __name__=="__main__":
+    main()
+
+# if prompt := st.chat_input(placeholder="Can I use my Medisave for tooth extraction?"):
+
+#     st.session_state.messages.append({"role": "user", "content": prompt})
+#     st.chat_message("user").write(prompt)
+
+#     llm = ChatOpenAI(model_name=OPENAI_MODEL_NAME, openai_api_key=OPENAI_API_KEY, streaming=True)
+#     search = DuckDuckGoSearchRun(name="Search")
+#     search_agent = initialize_agent(
+#         [search], llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, handle_parsing_errors=True
+#     )
+
+#     with st.chat_message("assistant"):
+#         st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
+#         # response = search_agent.run(st.session_state.messages, callbacks=[st_cb])
+#         response=crew.kickoff(inputs=st.chat_input())
+#         st.session_state.messages.append({"role": "assistant", "content": response})
+#         st.write(response)
